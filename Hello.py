@@ -1,90 +1,55 @@
-import os
-import tempfile
+from dotenv import load_dotenv
 import streamlit as st
-from streamlit_chat import message
-from pdfquery import PDFQuery
-
-st.set_page_config(page_title="ChatPDF")
-
-
-def display_messages():
-    st.subheader("Chat")
-    for i, (msg, is_user) in enumerate(st.session_state["messages"]):
-        message(msg, is_user=is_user, key=str(i))
-    st.session_state["thinking_spinner"] = st.empty()
-
-
-def process_input():
-    if st.session_state["user_input"] and len(st.session_state["user_input"].strip()) > 0:
-        user_text = st.session_state["user_input"].strip()
-        with st.session_state["thinking_spinner"], st.spinner(f"Thinking"):
-            query_text = st.session_state["pdfquery"].ask(user_text)
-
-        st.session_state["messages"].append((user_text, True))
-        st.session_state["messages"].append((query_text, False))
-
-
-def read_and_save_file():
-    st.session_state["pdfquery"].forget()  # to reset the knowledge base
-    st.session_state["messages"] = []
-    st.session_state["user_input"] = ""
-
-    for file in st.session_state["file_uploader"]:
-        with tempfile.NamedTemporaryFile(delete=False) as tf:
-            tf.write(file.getbuffer())
-            file_path = tf.name
-
-        with st.session_state["ingestion_spinner"], st.spinner(f"Ingesting {file.name}"):
-            st.session_state["pdfquery"].ingest(file_path)
-        os.remove(file_path)
-
-
-def is_openai_api_key_set() -> bool:
-    return len(st.session_state["OPENAI_API_KEY"]) > 0
+from PyPDF2 import PdfReader
+from langchain.text_splitter import CharacterTextSplitter
+from langchain.embeddings.openai import OpenAIEmbeddings
+from langchain.vectorstores import FAISS
+from langchain.chains.question_answering import load_qa_chain
+from langchain.llms import OpenAI
+from langchain.callbacks import get_openai_callback
 
 
 def main():
-    if len(st.session_state) == 0:
-        st.session_state["messages"] = []
-        st.session_state["OPENAI_API_KEY"] = os.environ.get("OPENAI_API_KEY", "")
-        if is_openai_api_key_set():
-            st.session_state["pdfquery"] = PDFQuery(st.session_state["OPENAI_API_KEY"])
-        else:
-            st.session_state["pdfquery"] = None
+    load_dotenv()
+    st.set_page_config(page_title="Ask your PDF")
+    st.header("Ask your PDF 💬")
+    
+    # upload file
+    pdf = st.file_uploader("Upload your PDF", type="pdf")
+    
+    # extract the text
+    if pdf is not None:
+      pdf_reader = PdfReader(pdf)
+      text = ""
+      for page in pdf_reader.pages:
+        text += page.extract_text()
+        
+      # split into chunks
+      text_splitter = CharacterTextSplitter(
+        separator="\n",
+        chunk_size=1000,
+        chunk_overlap=200,
+        length_function=len
+      )
+      chunks = text_splitter.split_text(text)
+      
+      # create embeddings
+      embeddings = OpenAIEmbeddings()
+      knowledge_base = FAISS.from_texts(chunks, embeddings)
+      
+      # show user input
+      user_question = st.text_input("Ask a question about your PDF:")
+      if user_question:
+        docs = knowledge_base.similarity_search(user_question)
+        
+        llm = OpenAI()
+        chain = load_qa_chain(llm, chain_type="stuff")
+        with get_openai_callback() as cb:
+          response = chain.run(input_documents=docs, question=user_question)
+          print(cb)
+           
+        st.write(response)
+    
 
-    st.header("ChatPDF")
-
-    if st.text_input("OpenAI API Key", value=st.session_state["OPENAI_API_KEY"], key="input_OPENAI_API_KEY", type="password"):
-        if (
-            len(st.session_state["input_OPENAI_API_KEY"]) > 0
-            and st.session_state["input_OPENAI_API_KEY"] != st.session_state["OPENAI_API_KEY"]
-        ):
-            st.session_state["OPENAI_API_KEY"] = st.session_state["input_OPENAI_API_KEY"]
-            if st.session_state["pdfquery"] is not None:
-                st.warning("Please, upload the files again.")
-            st.session_state["messages"] = []
-            st.session_state["user_input"] = ""
-            st.session_state["pdfquery"] = PDFQuery(st.session_state["OPENAI_API_KEY"])
-
-    st.subheader("Upload a document")
-    st.file_uploader(
-        "Upload document",
-        type=["pdf"],
-        key="file_uploader",
-        on_change=read_and_save_file,
-        label_visibility="collapsed",
-        accept_multiple_files=True,
-        disabled=not is_openai_api_key_set(),
-    )
-
-    st.session_state["ingestion_spinner"] = st.empty()
-
-    display_messages()
-    st.text_input("Message", key="user_input", disabled=not is_openai_api_key_set(), on_change=process_input)
-
-    st.divider()
-    st.markdown("Source code: [Github](https://github.com/Anil-matcha/ChatPDF)")
-
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
